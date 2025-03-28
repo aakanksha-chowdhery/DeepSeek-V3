@@ -69,12 +69,16 @@ class ModelArgs:
     n_limited_groups: int = 1
     score_func: Literal["softmax", "sigmoid"] = "softmax"
     route_scale: float = 1.
+    norm_topk_prob: int =  True
+    topk_method: Literal["noaux_tc", "greedy"] = "noaux_tc"
+    
     # mla
     q_lora_rank: int = 0
     kv_lora_rank: int = 512
     qk_nope_head_dim: int = 128
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
+    
     # yarn
     original_seq_len: int = 4096
     rope_theta: float = 10000.0
@@ -82,6 +86,8 @@ class ModelArgs:
     beta_fast: int = 32
     beta_slow: int = 1
     mscale: float = 1.
+    
+    
 
 
 class ParallelEmbedding(nn.Module):
@@ -385,9 +391,15 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     """
     dtype = x.dtype
     x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
+    if freqs_cis.dim() == 3:  # [batch_size, seq_len, dims//2]
+        # Reshape freqs_cis to [batch_size, seq_len, 1, head_dim//2]
+        # when position_ids is not None
+        freqs_cis = freqs_cis.unsqueeze(2)
+    else:  # [seq_len, dims//2]
+        freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
     y = torch.view_as_real(x * freqs_cis).flatten(3)
     return y.to(dtype)
+
 
 
 class MLA(nn.Module):
@@ -440,7 +452,7 @@ class MLA(nn.Module):
             self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.kv_lora_rank), persistent=False)
             self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.qk_rope_head_dim), persistent=False)
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor], position_ids: Optional[torch.LongTensor] = None):
         """
         Forward pass for the Multi-Headed Attention Layer (MLA).
 
@@ -449,22 +461,35 @@ class MLA(nn.Module):
             start_pos (int): Starting position in the sequence for caching.
             freqs_cis (torch.Tensor): Precomputed complex exponential values for rotary embeddings.
             mask (Optional[torch.Tensor]): Mask tensor to exclude certain positions from attention.
+            position_ids: Optional position indices tensor of shape [batch_size, seq_len]
+                   Used for non-consecutive positions (e.g., with caching)
 
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
         """
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
+        # If position_ids are not provided, create them based on start_pos
+        if position_ids is None:
+            # [1, seq_len] -> [batch_size, seq_len]
+            position_ids = torch.arange(start_pos, end_pos, dtype=torch.long)  # type: ignore
+            position_ids = position_ids.unsqueeze(0).expand(bsz, seqlen)  # type: ignore
         if self.q_lora_rank == 0:
             q = self.wq(x)
         else:
             q = self.wq_b(self.q_norm(self.wq_a(x)))
         q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        q_pe = apply_rotary_emb(q_pe, freqs_cis)
+        
+        # Get the freqs_cis at the specific positions we need
+        # [batch_size, seq_len, qk_rope_head_dim//2] complex tensor
+        position_freqs_cis = (
+        freqs_cis[position_ids] if position_ids is not None else freqs_cis
+        )
+        q_pe = apply_rotary_emb(q_pe, position_freqs_cis)
         kv = self.wkv_a(x)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
+        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), position_freqs_cis)
         if attn_impl == "naive":
             q = torch.cat([q_nope, q_pe], dim=-1)
             kv = self.wkv_b(self.kv_norm(kv))
@@ -557,6 +582,8 @@ class Gate(nn.Module):
         self.topk_groups = args.n_limited_groups
         self.score_func = args.score_func
         self.route_scale = args.route_scale
+        self.topk_method = args.topk_method
+        self.norm_topk_prob = args.norm_topk_prob
         self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
         self.bias = nn.Parameter(torch.empty(args.n_routed_experts)) if self.dim == 7168 else None
 
@@ -578,7 +605,7 @@ class Gate(nn.Module):
         original_scores = scores
         if self.bias is not None:
             scores = scores + self.bias
-        if self.n_groups > 1:
+        if self.n_groups > 1 and self.topk_method == "noaux_tc":
             scores = scores.view(x.size(0), self.n_groups, -1)
             if self.bias is None:
                 group_scores = scores.amax(dim=-1)
@@ -587,10 +614,24 @@ class Gate(nn.Module):
             indices = group_scores.topk(self.topk_groups, dim=-1)[1]
             mask = scores.new_ones(x.size(0), self.n_groups, dtype=bool).scatter_(1, indices, False)
             scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
-        indices = torch.topk(scores, self.topk, dim=-1)[1]
-        weights = original_scores.gather(1, indices)
+            indices = torch.topk(scores, self.topk, dim=-1)[1]
+            weights = original_scores.gather(1, indices)
+        elif self.topk_method == "greedy":
+            weights, indices = torch.topk(
+                scores, k=self.topk, dim=-1, sorted=False
+            )
+        else:
+            raise NotImplementedError(
+                f"insupportable TopK function for MoE gating: {self.topk_method}"
+            )
+        
+        
         if self.score_func == "sigmoid":
             weights /= weights.sum(dim=-1, keepdim=True)
+        # norm gate to sum 1
+        elif self.topk > 1 and self.norm_topk_prob:
+            denominator = weights.sum(dim=-1, keepdim=True) + 1e-20
+            weights= weights / denominator
         weights *= self.route_scale
         return weights.type_as(x), indices
 
