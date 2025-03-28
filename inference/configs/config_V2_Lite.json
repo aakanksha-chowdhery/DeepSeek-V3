@@ -16,10 +16,7 @@
     "qk_rope_head_dim": 64,
     "v_head_dim": 128,
     "mscale": 0.707,
-<<<<<<< HEAD
     "mscale_all_dim": 0.707,
-=======
->>>>>>> 753a5a35717afe0d43415ad4bfaf11d2bde6dc77
     "norm_topk_prob": 0,
     "score_func": "softmax",
     "topk_method": "greedy"
