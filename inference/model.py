@@ -69,12 +69,16 @@ class ModelArgs:
     n_limited_groups: int = 1
     score_func: Literal["softmax", "sigmoid"] = "softmax"
     route_scale: float = 1.
+    norm_topk_prob: int =  True
+    topk_method: Literal["noaux_tc", "greedy"] = "noaux_tc"
+    
     # mla
     q_lora_rank: int = 0
     kv_lora_rank: int = 512
     qk_nope_head_dim: int = 128
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
+    
     # yarn
     original_seq_len: int = 4096
     rope_theta: float = 10000.0
@@ -82,6 +86,13 @@ class ModelArgs:
     beta_fast: int = 32
     beta_slow: int = 1
     mscale: float = 1.
+    mscale_all_dim: float = 1.
+    
+    
+    aux_loss_alpha: float = 0.0
+    use_seq_aux_loss: bool = False
+    
+    
 
 
 class ParallelEmbedding(nn.Module):
@@ -171,7 +182,7 @@ class Linear(nn.Module):
         bias (bool): Whether to include a bias term. Defaults to False.
         dtype (optional): Data type for the layer. Defaults to `torch.bfloat16`.
     """
-    dtype = torch.bfloat16
+    dtype = torch.bfloat16 ## why?
 
     def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
         super().__init__()
@@ -289,6 +300,22 @@ class RMSNorm(nn.Module):
             torch.Tensor: Normalized tensor with the same shape as input.
         """
         return F.rms_norm(x, (self.dim,), self.weight, self.eps)
+    
+    
+def yarn_get_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
+  """Calculate mscale factor for YaRN scaling.
+
+  Args:
+      scale: Scaling factor for context extension
+      mscale: Base mscale parameter
+
+  Returns:
+      Computed mscale value
+  """
+  if scale <= 1:
+    return 1.0
+  return 0.1 * mscale * math.log(scale) + 1.0
+
 
 
 def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
@@ -363,8 +390,16 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
     freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
     if seqlen > args.original_seq_len:
         low, high = find_correction_range(beta_fast, beta_slow, dim, base, args.original_seq_len)
-        smooth = 1 - linear_ramp_factor(low, high, dim // 2)
+        smooth = 1 - linear_ramp_factor(low, high, dim // 2).to(dtype=torch.float32)
         freqs = freqs / factor * (1 - smooth) + freqs * smooth
+        freqs = freqs.to(dtype=torch.float32)
+        
+    # Apply mscale if using extended context
+    if args.max_seq_len > args.original_seq_len:
+        _mscale = float(
+        yarn_get_mscale(factor, args.mscale) / yarn_get_mscale(factor, args.mscale_all_dim)
+        )
+        freqs = freqs * _mscale
 
     t = torch.arange(seqlen)
     freqs = torch.outer(t, freqs)
@@ -385,9 +420,15 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     """
     dtype = x.dtype
     x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
+    if freqs_cis.dim() == 3:  # [batch_size, seq_len, dims//2]
+        # Reshape freqs_cis to [batch_size, seq_len, 1, head_dim//2]
+        # when position_ids is not None
+        freqs_cis = freqs_cis.unsqueeze(2)
+    else:  # [seq_len, dims//2]
+        freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
     y = torch.view_as_real(x * freqs_cis).flatten(3)
     return y.to(dtype)
+
 
 
 class MLA(nn.Module):
@@ -430,7 +471,7 @@ class MLA(nn.Module):
         self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
         self.softmax_scale = self.qk_head_dim ** -0.5
         if args.max_seq_len > args.original_seq_len:
-            mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
+            mscale = yarn_get_mscale(args.rope_factor, args.mscale_all_dim)
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
         if attn_impl == "naive":
@@ -449,18 +490,23 @@ class MLA(nn.Module):
             start_pos (int): Starting position in the sequence for caching.
             freqs_cis (torch.Tensor): Precomputed complex exponential values for rotary embeddings.
             mask (Optional[torch.Tensor]): Mask tensor to exclude certain positions from attention.
+            position_ids: Optional position indices tensor of shape [batch_size, seq_len]
+                   Used for non-consecutive positions (e.g., with caching)
 
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
         """
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
+
         if self.q_lora_rank == 0:
             q = self.wq(x)
         else:
             q = self.wq_b(self.q_norm(self.wq_a(x)))
         q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        
+        
         q_pe = apply_rotary_emb(q_pe, freqs_cis)
         kv = self.wkv_a(x)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
@@ -557,8 +603,79 @@ class Gate(nn.Module):
         self.topk_groups = args.n_limited_groups
         self.score_func = args.score_func
         self.route_scale = args.route_scale
+        self.topk_method = args.topk_method
+        self.norm_topk_prob = args.norm_topk_prob
         self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
         self.bias = nn.Parameter(torch.empty(args.n_routed_experts)) if self.dim == 7168 else None
+        self.aux_loss_alpha = args.aux_loss_alpha
+        self.use_seq_aux_loss = args.use_seq_aux_loss
+        
+    def compute_auxiliary_loss(
+            self,
+            scores: torch.Tensor,
+            indices: torch.Tensor,
+            bsz: int,
+            seq_len: int,
+        ) -> Optional[torch.Tensor]:
+            """
+            Compute auxiliary loss for balanced expert utilization if training.
+
+            Args:
+                scores: Expert scores of shape [bsz*seq_len, num_routed_experts]
+                indices: Selected expert indices [bsz*seq_len, topk]
+                bsz: Batch size
+                seq_len: Sequence length
+
+            Returns:
+                Auxiliary loss tensor or None if not training
+            """
+            if not self.training or self.aux_loss_alpha <= 0.0:
+                return None
+            # Compute aux loss based on the greedy topk method
+            # topk_idx_for_aux_loss: [bsz, seq_len * top_k]
+            topk_idx_for_aux_loss = indices.view(bsz, -1)
+
+            if self.use_seq_aux_loss:
+                # Sequence-level auxiliary loss
+
+                # scores_for_seq_aux: [bsz, seq_len, num_routed_experts]
+                scores_for_seq_aux = scores.view(bsz, seq_len, -1)
+
+                # ce: [bsz, num_routed_experts] - count of tokens per expert per sequence
+                ce = torch.zeros(bsz, self.n_routed_experts)
+                # scatter_add_ accumulates token counts by expert
+                # torch.ones: [bsz, seq_len * topk]
+                ce.scatter_add_(
+                    1,
+                    topk_idx_for_aux_loss,
+                    torch.ones(bsz, seq_len * self.topk),
+                )
+                # Normalize by expected count
+                ce.div_(seq_len * self.topk / self.n_routed_experts)
+
+                # Compute loss using sequence-level router probs
+                # scores_for_seq_aux.mean(dim=1): [bsz, num_routed_experts]
+                # ce: [bsz, num_routed_experts]
+                # aux_loss: scalar
+                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(
+                    dim=1
+                ).mean() * self.aux_loss_alpha
+            else:
+                # Token-level auxiliary loss
+                # mask_ce: [bsz * seq_len * top_k, n_routed_experts] - one-hot encoding of selected experts
+                mask_ce = F.one_hot(
+                    topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts
+                )
+                # ce: [num_routed_experts] - fraction of tokens routed to each expert
+                ce = mask_ce.float().mean(0)
+                # Pi: [num_routed_experts] - mean router probability for each expert
+                Pi = scores.mean(0)
+                # fi: [num_routed_experts] - ce scaled by number of experts
+                fi = ce * self.n_routed_experts
+                # aux_loss: scalar
+                aux_loss = (Pi * fi).sum() * self.aux_loss_alpha
+
+            return aux_loss
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -569,7 +686,17 @@ class Gate(nn.Module):
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
+            
         """
+        # Get input shape and reshape if needed
+        orig_shape = x.shape
+        if len(orig_shape) == 3:
+            bsz, seq_len, _ = orig_shape
+            x = x.view(-1, self.dim)
+        else:
+            # Assume input is already flattened
+            bsz = 1
+            seq_len = x.size(0)
         scores = linear(x, self.weight)
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1, dtype=torch.float32)
@@ -578,21 +705,37 @@ class Gate(nn.Module):
         original_scores = scores
         if self.bias is not None:
             scores = scores + self.bias
-        if self.n_groups > 1:
+        if self.n_groups > 1 and self.topk_method == "noaux_tc":
             scores = scores.view(x.size(0), self.n_groups, -1)
             if self.bias is None:
                 group_scores = scores.amax(dim=-1)
             else:
                 group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
-            indices = group_scores.topk(self.topk_groups, dim=-1)[1]
+            indices = group_scores.topk(self.topk_groups, dim=-1, sorted=False)[1]
             mask = scores.new_ones(x.size(0), self.n_groups, dtype=bool).scatter_(1, indices, False)
             scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
-        indices = torch.topk(scores, self.topk, dim=-1)[1]
-        weights = original_scores.gather(1, indices)
+            indices = torch.topk(scores, self.topk, dim=-1)[1]
+            weights = original_scores.gather(1, indices)
+        elif self.topk_method == "greedy":
+            weights, indices = torch.topk(
+                scores, k=self.topk, dim=-1, sorted=False
+            )
+        else:
+            raise NotImplementedError(
+                f"insupportable TopK function for MoE gating: {self.topk_method}"
+            )
+        
+        
         if self.score_func == "sigmoid":
             weights /= weights.sum(dim=-1, keepdim=True)
+        # norm gate to sum 1
+        elif self.topk > 1 and self.norm_topk_prob:
+            denominator = weights.sum(dim=-1, keepdim=True) + 1e-20
+            weights= weights / denominator
         weights *= self.route_scale
-        return weights.type_as(x), indices
+        # Compute auxiliary loss
+        aux_loss = self.compute_auxiliary_loss(original_scores, indices, bsz, seq_len)
+        return weights.type_as(x), indices, aux_loss
 
 
 class Expert(nn.Module):
@@ -675,7 +818,7 @@ class MoE(nn.Module):
         """
         shape = x.size()
         x = x.view(-1, self.dim)
-        weights, indices = self.gate(x)
+        weights, indices, aux_loss = self.gate(x)
         y = torch.zeros_like(x)
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
         for i in range(self.experts_start_idx, self.experts_end_idx):
