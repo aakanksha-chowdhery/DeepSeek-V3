@@ -914,7 +914,7 @@ class Transformer(nn.Module):
         self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.get_default_dtype())
         self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
 
-    @torch.inference_mode()
+
     def forward(self, tokens: torch.Tensor, start_pos: int = 0):
         """
         Forward pass for the Transformer model.
@@ -946,18 +946,24 @@ class Transformer(nn.Module):
             # Apply norm to the full sequence
             h = self.norm(h)  # Shape: [batch_size, seq_len, dim]
             
-            # Project to vocabulary for each position in the sequence
-            logits = []
-            for i in range(seqlen):
-                logit = self.head(h[:, i])
-                if world_size > 1:
-                    all_logits = [torch.empty_like(logit) for _ in range(world_size)]
-                    dist.all_gather(all_logits, logit)
-                    logit = torch.cat(all_logits, dim=-1)
-                logits.append(logit)
-            
-            # Stack sequence-level predictions
-            return torch.stack(logits, dim=1)
+            # Project to vocabulary for all positions
+            logits = self.head(h)  # Shape: [batch_size, seq_len, vocab_size]
+            # Handle distributed processing if needed
+            if world_size > 1:
+                # This needs modification since we now have sequence dimension
+                # Need to gather across all processes for each position
+                gathered_logits = []
+                for i in range(seqlen):
+                    position_logits = logits[:, i]  # [batch_size, vocab_size]
+                    all_logits = [torch.empty_like(position_logits) for _ in range(world_size)]
+                    dist.all_gather(all_logits, position_logits)
+                    gathered_position_logits = torch.cat(all_logits, dim=-1)
+                    gathered_logits.append(gathered_position_logits)
+                
+                # Stack back into sequence dimension
+                logits = torch.stack(gathered_logits, dim=1)  # [batch_size, seq_len, full_vocab_size]
+    
+            return logits
             
 
 
