@@ -481,7 +481,7 @@ class MLA(nn.Module):
             self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.kv_lora_rank), persistent=False)
             self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.qk_rope_head_dim), persistent=False)
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor], position_ids: Optional[torch.LongTensor] = None):
         """
         Forward pass for the Multi-Headed Attention Layer (MLA).
 
@@ -510,7 +510,7 @@ class MLA(nn.Module):
         q_pe = apply_rotary_emb(q_pe, freqs_cis)
         kv = self.wkv_a(x)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
+        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), position_freqs_cis)
         if attn_impl == "naive":
             q = torch.cat([q_nope, q_pe], dim=-1)
             kv = self.wkv_b(self.kv_norm(kv))
@@ -603,6 +603,8 @@ class Gate(nn.Module):
         self.topk_groups = args.n_limited_groups
         self.score_func = args.score_func
         self.route_scale = args.route_scale
+        self.topk_method = args.topk_method
+        self.norm_topk_prob = args.norm_topk_prob
         self.topk_method = args.topk_method
         self.norm_topk_prob = args.norm_topk_prob
         self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
@@ -728,6 +730,10 @@ class Gate(nn.Module):
         
         if self.score_func == "sigmoid":
             weights /= weights.sum(dim=-1, keepdim=True)
+        # norm gate to sum 1
+        elif self.topk > 1 and self.norm_topk_prob:
+            denominator = weights.sum(dim=-1, keepdim=True) + 1e-20
+            weights= weights / denominator
         # norm gate to sum 1
         elif self.topk > 1 and self.norm_topk_prob:
             denominator = weights.sum(dim=-1, keepdim=True) + 1e-20
