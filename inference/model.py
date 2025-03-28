@@ -934,13 +934,31 @@ class Transformer(nn.Module):
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
-        h = self.norm(h)[:, -1]
-        logits = self.head(h)
-        if world_size > 1:
-            all_logits = [torch.empty_like(logits) for _ in range(world_size)]
-            dist.all_gather(all_logits, logits)
-            logits = torch.cat(all_logits, dim=-1)
-        return logits
+        if not self.training:
+            h = self.norm(h)[:, -1]
+            logits = self.head(h)
+            if world_size > 1:
+                all_logits = [torch.empty_like(logits) for _ in range(world_size)]
+                dist.all_gather(all_logits, logits)
+                logits = torch.cat(all_logits, dim=-1)
+            return logits
+        else:
+            # Apply norm to the full sequence
+            h = self.norm(h)  # Shape: [batch_size, seq_len, dim]
+            
+            # Project to vocabulary for each position in the sequence
+            logits = []
+            for i in range(seqlen):
+                logit = self.head(h[:, i])
+                if world_size > 1:
+                    all_logits = [torch.empty_like(logit) for _ in range(world_size)]
+                    dist.all_gather(all_logits, logit)
+                    logit = torch.cat(all_logits, dim=-1)
+                logits.append(logit)
+            
+            # Stack sequence-level predictions
+            return torch.stack(logits, dim=1)
+            
 
 
 if __name__ == "__main__":
