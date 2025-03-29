@@ -510,22 +510,28 @@ class MLA(nn.Module):
         q_pe = apply_rotary_emb(q_pe, freqs_cis)
         kv = self.wkv_a(x)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), position_freqs_cis)
+        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
         if attn_impl == "naive":
+            
             q = torch.cat([q_nope, q_pe], dim=-1)
             kv = self.wkv_b(self.kv_norm(kv))
             kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
-            self.k_cache[:bsz, start_pos:end_pos] = k
-            self.v_cache[:bsz, start_pos:end_pos] = v
+            # Detach caches to avoid backward graph issues
+            k_cache = self.k_cache.detach()
+            v_cache = self.v_cache.detach()
+            k_cache[:bsz, start_pos:end_pos] = k
+            v_cache[:bsz, start_pos:end_pos] = v
             scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
         else:
             wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
             q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
-            self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
-            self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
+            kv_cache = self.kv_cache.detach()
+            pe_cache = self.pe_cache.detach()
+            kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
+            pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
             scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
                       torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
         if mask is not None:
@@ -707,15 +713,16 @@ class Gate(nn.Module):
         original_scores = scores
         if self.bias is not None:
             scores = scores + self.bias
-        if self.n_groups > 1 and self.topk_method == "noaux_tc":
-            scores = scores.view(x.size(0), self.n_groups, -1)
-            if self.bias is None:
-                group_scores = scores.amax(dim=-1)
-            else:
-                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
-            indices = group_scores.topk(self.topk_groups, dim=-1, sorted=False)[1]
-            mask = scores.new_ones(x.size(0), self.n_groups, dtype=bool).scatter_(1, indices, False)
-            scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
+        if self.topk_method == "noaux_tc":
+            if self.n_groups > 1:
+                scores = scores.view(x.size(0), self.n_groups, -1)
+                if self.bias is None:
+                    group_scores = scores.amax(dim=-1)
+                else:
+                    group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
+                indices = group_scores.topk(self.topk_groups, dim=-1, sorted=False)[1]
+                mask = scores.new_ones(x.size(0), self.n_groups, dtype=bool).scatter_(1, indices, False)
+                scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
             indices = torch.topk(scores, self.topk, dim=-1)[1]
             weights = original_scores.gather(1, indices)
         elif self.topk_method == "greedy":
@@ -928,13 +935,13 @@ class Transformer(nn.Module):
         """
         seqlen = tokens.size(1)
         h = self.embed(tokens)
-        freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
+        freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen].detach()
         mask = None
         if seqlen > 1:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
-        if not self.training:
+        if False:
             h = self.norm(h)[:, -1]
             logits = self.head(h)
             if world_size > 1:
@@ -948,6 +955,7 @@ class Transformer(nn.Module):
             
             # Project to vocabulary for all positions
             logits = self.head(h)  # Shape: [batch_size, seq_len, vocab_size]
+
             # Handle distributed processing if needed
             if world_size > 1:
                 # This needs modification since we now have sequence dimension
