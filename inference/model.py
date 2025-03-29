@@ -98,6 +98,7 @@ class ModelArgs:
 class ParallelEmbedding(nn.Module):
     """
     Embedding layer with parallelism support across distributed processes.
+    Parallelism is in vocab dim
 
     Args:
         vocab_size (int): Vocabulary size.
@@ -135,6 +136,8 @@ class ParallelEmbedding(nn.Module):
             y[mask] = 0
             dist.all_reduce(y)
         return y
+        # # Reduce across all the model parallel GPUs.
+        # y = reduce_from_model_parallel_region(y_parallel)
 
 
 def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -238,7 +241,15 @@ class ColumnParallelLinear(Linear):
         Returns:
             torch.Tensor: Transformed tensor with column-parallel computation.
         """
+        # Set up backprop all-reduce.
+        # input_parallel = copy_to_model_parallel_region(input_)
+
+        
         y = linear(x, self.weight, self.bias)
+        
+        # if self.gather_output: we dont do this for FFN layer
+        #     # All-gather across the partitions.
+        #     output = gather_from_model_parallel_region(output_parallel)
         return y
 
 
@@ -267,9 +278,13 @@ class RowParallelLinear(Linear):
         Returns:
             torch.Tensor: Transformed tensor with row-parallel computation.
         """
+        # if not self.input_is_parallel:
+        #     input_parallel = scatter_to_model_parallel_region(input_)
         y = linear(x, self.weight)
         if world_size > 1:
             dist.all_reduce(y)
+        # All-reduce across all the partitions.
+        # output_ = reduce_from_model_parallel_region(output_parallel)
         if self.bias is not None:
             y += self.bias
         return y
