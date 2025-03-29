@@ -69,6 +69,8 @@ class ModelArgs:
     n_limited_groups: int = 1
     score_func: Literal["softmax", "sigmoid"] = "softmax"
     route_scale: float = 1.
+    norm_topk_prob: int =  True
+    topk_method: Literal["noaux_tc", "greedy"] = "noaux_tc"
     # mla
     q_lora_rank: int = 0
     kv_lora_rank: int = 512
@@ -82,6 +84,11 @@ class ModelArgs:
     beta_fast: int = 32
     beta_slow: int = 1
     mscale: float = 1.
+    mscale_all_dim: float = 1.
+     
+     
+    aux_loss_alpha: float = 0.0
+    use_seq_aux_loss: bool = False
 
 
 class ParallelEmbedding(nn.Module):
@@ -290,6 +297,20 @@ class RMSNorm(nn.Module):
         """
         return F.rms_norm(x, (self.dim,), self.weight, self.eps)
 
+def yarn_get_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
+   """Calculate mscale factor for YaRN scaling.
+ 
+   Args:
+       scale: Scaling factor for context extension
+       mscale: Base mscale parameter
+ 
+   Returns:
+       Computed mscale value
+   """
+   if scale <= 1:
+     return 1.0
+   return 0.1 * mscale * math.log(scale) + 1.0
+
 
 def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
     """
@@ -363,8 +384,16 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
     freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
     if seqlen > args.original_seq_len:
         low, high = find_correction_range(beta_fast, beta_slow, dim, base, args.original_seq_len)
-        smooth = 1 - linear_ramp_factor(low, high, dim // 2)
+        smooth = 1 - linear_ramp_factor(low, high, dim // 2).to(dtype=torch.float32)
         freqs = freqs / factor * (1 - smooth) + freqs * smooth
+        freqs = freqs.to(dtype=torch.float32)
+    
+    # Apply mscale if using extended context
+    if args.max_seq_len > args.original_seq_len:
+        _mscale = float(
+        yarn_get_mscale(factor, args.mscale) / yarn_get_mscale(factor, args.mscale_all_dim)
+         )
+        freqs = freqs * _mscale
 
     t = torch.arange(seqlen)
     freqs = torch.outer(t, freqs)
@@ -430,7 +459,7 @@ class MLA(nn.Module):
         self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
         self.softmax_scale = self.qk_head_dim ** -0.5
         if args.max_seq_len > args.original_seq_len:
-            mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
+            mscale = yarn_get_mscale(args.rope_factor, args.mscale_all_dim)
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
         if attn_impl == "naive":
@@ -557,8 +586,12 @@ class Gate(nn.Module):
         self.topk_groups = args.n_limited_groups
         self.score_func = args.score_func
         self.route_scale = args.route_scale
+        self.topk_method = args.topk_method
+        self.norm_topk_prob = args.norm_topk_prob
         self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
         self.bias = nn.Parameter(torch.empty(args.n_routed_experts)) if self.dim == 7168 else None
+        self.aux_loss_alpha = args.aux_loss_alpha
+        self.use_seq_aux_loss = args.use_seq_aux_loss
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -578,19 +611,32 @@ class Gate(nn.Module):
         original_scores = scores
         if self.bias is not None:
             scores = scores + self.bias
-        if self.n_groups > 1:
-            scores = scores.view(x.size(0), self.n_groups, -1)
-            if self.bias is None:
-                group_scores = scores.amax(dim=-1)
-            else:
-                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
-            indices = group_scores.topk(self.topk_groups, dim=-1)[1]
-            mask = scores.new_ones(x.size(0), self.n_groups, dtype=bool).scatter_(1, indices, False)
-            scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
-        indices = torch.topk(scores, self.topk, dim=-1)[1]
-        weights = original_scores.gather(1, indices)
+        if self.topk_method == "noaux_tc":
+            if self.n_groups > 1:
+                scores = scores.view(x.size(0), self.n_groups, -1)
+                if self.bias is None:
+                    group_scores = scores.amax(dim=-1)
+                else:
+                    group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
+                indices = group_scores.topk(self.topk_groups, dim=-1)[1]
+                mask = scores.new_ones(x.size(0), self.n_groups, dtype=bool).scatter_(1, indices, False)
+                scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
+            indices = torch.topk(scores, self.topk, dim=-1)[1]
+            weights = original_scores.gather(1, indices)
+        elif self.topk_method == "greedy":
+            weights, indices = torch.topk(
+                 scores, k=self.topk, dim=-1, sorted=False
+             )
+        else:
+            raise NotImplementedError(
+                 f"insupportable TopK function for MoE gating: {self.topk_method}"
+             )
         if self.score_func == "sigmoid":
             weights /= weights.sum(dim=-1, keepdim=True)
+        # norm gate to sum 1
+        elif self.topk > 1 and self.norm_topk_prob:
+            denominator = weights.sum(dim=-1, keepdim=True) + 1e-20
+            weights= weights / denominator
         weights *= self.route_scale
         return weights.type_as(x), indices
 
